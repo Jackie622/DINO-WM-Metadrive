@@ -292,6 +292,10 @@ def _worker(
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
+            elif cmd == "rollout_controller_actions":
+                p.send(env.rollout_controller_actions(*data))
+            elif cmd == "save_expert_video":
+                p.send(env.save_expert_video(*data))
             elif cmd == "prepare":
                 obs, state_dct = env.prepare(data[0], data[1])
                 if obs_bufs is not None:
@@ -299,7 +303,7 @@ def _worker(
                     obs = None
                 p.send((obs, state_dct))
             elif cmd == "sample_random_init_goal_states":
-                state = env.sample_random_init_goal_states(data)
+                state = env.sample_random_init_goal_states(*data) if isinstance(data, tuple) else env.sample_random_init_goal_states(data)
                 p.send(state)
             elif cmd == "eval_state":
                 p.send(env.eval_state(data[0], data[1])) 
@@ -447,13 +451,41 @@ class SubprocEnvWorker(EnvWorker):
     
     def rollout(self,seed,init_state,actions):
         self.parent_remote.send(["rollout", (seed, init_state, actions)])
-    
+
+    def rollout_controller_actions(self, seed, init_state, goal_state, horizon, reverse, history_actions=None):
+        self.parent_remote.send(["rollout_controller_actions", (seed, init_state, goal_state, horizon, reverse, history_actions)])
+        return self.parent_remote.recv()
+
+    def save_expert_video(self, seed, filename, max_steps=500, fps=10, start_from_t0=False):
+        self.parent_remote.send(["save_expert_video", (seed, filename, max_steps, fps, start_from_t0)])
+        return self.parent_remote.recv()
+
     def prepare(self, seed, init_state):
         self.parent_remote.send(["prepare", (seed, init_state)])
         return self.parent_remote.recv()
     
-    def sample_random_init_goal_states(self, seed):
-        self.parent_remote.send(["sample_random_init_goal_states", seed])
+    def sample_random_init_goal_states(
+        self,
+        seed,
+        num_phases=3,
+        subgoal_mode="fixed",
+        phase_h=None,
+        subgoal_setup_policy="snap_to_expert",
+        setup_snap_warn_dist=1.0,
+        setup_neighbor_suppress_radius=1.0,
+    ):
+        self.parent_remote.send([
+            "sample_random_init_goal_states",
+            (
+                seed,
+                num_phases,
+                subgoal_mode,
+                phase_h,
+                subgoal_setup_policy,
+                setup_snap_warn_dist,
+                setup_neighbor_suppress_radius,
+            ),
+        ])
         return self.parent_remote.recv()
     
     def eval_state(self, goal_state, cur_state):
@@ -883,7 +915,56 @@ class BaseVectorEnv(object):
         obses = aggregate_dct(obses)
         states = np.stack(states)
         return obses, states
-    
+
+    def rollout_controller_actions(
+        self,
+        seeds,
+        init_states,
+        goal_states,
+        horizon,
+        reverse,
+        history_actions=None,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ):
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if not self.is_async:
+            result = []
+            for i, j in enumerate(id):
+                cur_history = None if history_actions is None else history_actions[i]
+                result.append(
+                    self.workers[j].rollout_controller_actions(
+                        seeds[i], init_states[i], goal_states[i], horizon, reverse, cur_history
+                    )
+                )
+        else:
+            raise NotImplementedError
+        actions, final_states = tuple(zip(*result))
+        return np.stack(actions), np.stack(final_states)
+
+    def save_expert_video(
+        self,
+        seeds,
+        filenames,
+        max_steps=500,
+        fps=10,
+        start_from_t0=False,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ):
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if not self.is_async:
+            result = []
+            for i, j in enumerate(id):
+                result.append(
+                    self.workers[j].save_expert_video(
+                        seeds[i], filenames[i], max_steps, fps, start_from_t0
+                    )
+                )
+        else:
+            raise NotImplementedError
+        return result
+
     def prepare(self, seeds, init_states):
         self._assert_is_not_closed()
         obs_list = []
@@ -896,13 +977,35 @@ class BaseVectorEnv(object):
         state = np.stack(state)
         return obs, state
 
-    def sample_random_init_goal_states(self, seed):
+    def sample_random_init_goal_states(
+        self,
+        seed,
+        num_phases=3,
+        subgoal_mode="fixed",
+        phase_h=None,
+        subgoal_setup_policy="snap_to_expert",
+        setup_snap_warn_dist=1.0,
+        setup_neighbor_suppress_radius=1.0,
+    ):
         self._assert_is_not_closed()
-        # init_state, goal_state = zip(*(self.workers[i].sample_random_init_goal_states(seed[i]) for i in range(self.env_num)))
-        # return np.stack(init_state), np.stack(goal_state)
-        results = [self.workers[i].sample_random_init_goal_states(seed[i]) for i in range(self.env_num)]
-        init_state, sub_state, goal_state = zip(*results)
-        return np.stack(init_state), np.stack(sub_state), np.stack(goal_state)
+        results = [
+            self.workers[i].sample_random_init_goal_states(
+                seed[i],
+                num_phases,
+                subgoal_mode,
+                phase_h,
+                subgoal_setup_policy,
+                setup_snap_warn_dist,
+                setup_neighbor_suppress_radius,
+            )
+            for i in range(self.env_num)
+        ]
+        # results[i] = (obs_init, subgoal_obs_list, obs_goal) where subgoal_obs_list is a list of dicts
+        init_obses, subgoal_obs_lists, goal_obses = zip(*results)
+        # subgoal_obs_lists is a tuple of lists, transpose to list of tuples
+        num_subgoals = len(subgoal_obs_lists[0])
+        subgoal_obs_tuples = [tuple(subgoal_obs_lists[j][i] for j in range(len(subgoal_obs_lists))) for i in range(num_subgoals)]
+        return init_obses, subgoal_obs_tuples, goal_obses
     
     def eval_state(self, goal_state, cur_state):
         self._assert_is_not_closed()

@@ -7,7 +7,7 @@ from utils import slice_trajdict_with_t
 from .base_planner import BasePlanner
 
 
-class MPCPlanner(BasePlanner):
+class MPCPlannerGuided(BasePlanner):
     """
     an online planner so feedback from env is allowed
     """
@@ -26,6 +26,7 @@ class MPCPlanner(BasePlanner):
         wandb_run,
         logging_prefix="mpc_phase0",
         log_filename="logs.json",
+        save_video=True,
         **kwargs,
     ):
         super().__init__(
@@ -40,6 +41,7 @@ class MPCPlanner(BasePlanner):
         self.env = env
         self.max_iter = np.inf if max_iter is None else max_iter
         self.n_taken_actions = n_taken_actions
+        self.save_video = bool(save_video)
         self.logging_prefix = logging_prefix
         sub_planner["_target_"] = sub_planner["target"]
         self.sub_planner = hydra.utils.instantiate(
@@ -59,6 +61,8 @@ class MPCPlanner(BasePlanner):
         self.final_obs_0 = None   # last real obs after plan() completes
         self.final_state_0 = None  # last real state after plan() completes
         self.base_history = None  # prepended to history_actions for phase continuity
+        self.prior_actions = None  # normalized expert/demo prior for the current phase
+        self.save_rollout_images = bool(kwargs.get("save_rollout_images", True))
 
     def _apply_success_mask(self, actions):
         device = actions.device
@@ -106,10 +110,11 @@ class MPCPlanner(BasePlanner):
             if self.evaluator.history_actions is not None:
                 self.evaluator.assign_init_cond(obs_0=cur_obs_0, state_0=init_state_0)
                 
+            subplanner_actions = self.prior_actions if self.iter == 0 else memo_actions
             actions, _ = self.sub_planner.plan(
                 obs_0=cur_obs_0,
                 obs_g=obs_g,
-                actions=memo_actions,
+                actions=subplanner_actions,
             )
             actions = torch.clamp(actions, -2.5, 2.5)
             taken_actions = actions.detach()[:, : self.n_taken_actions]
@@ -133,14 +138,27 @@ class MPCPlanner(BasePlanner):
                 obs_0=cur_obs_0 if self.base_history is not None else init_obs_0,
                 state_0=init_state_0,
             )
-            print(f"[MPC DEBUG] Starting Phase-2 (or continued) eval: filename={self.logging_prefix}_plan{self.iter}, save_video=True")
-            logs, successes, e_obses, e_states = self.evaluator.eval_actions(
-                action_so_far,
-                self.action_len,
-                filename=f"{self.logging_prefix}_plan{self.iter}",
-                save_video=True,
+            rollout_filename = f"{self.logging_prefix}_plan{self.iter}"
+            print(
+                f"[MPC DEBUG] Starting Phase-2 (or continued) eval: "
+                f"filename={rollout_filename}, save_video={self.save_video}, "
+                f"save_image={self.save_rollout_images}"
             )
-            print(f"[MPC DEBUG] Eval finished for {self.logging_prefix}_plan{self.iter}")
+            original_decoder = self.evaluator.wm.decoder
+            if not self.save_rollout_images:
+                self.evaluator.wm.decoder = None
+            try:
+                logs, successes, e_obses, e_states = self.evaluator.eval_actions(
+                    action_so_far,
+                    self.action_len,
+                    filename=rollout_filename,
+                    save_video=self.save_video,
+                )
+            finally:
+                self.evaluator.wm.decoder = original_decoder
+            if self.save_rollout_images:
+                print(f"[MPC DEBUG] Rollout image saved: {rollout_filename}.png")
+            print(f"[MPC DEBUG] Eval finished for {rollout_filename}")
             new_successes = successes & ~self.is_success  # Identify new successes
             self.is_success = (
                 self.is_success | successes
@@ -208,3 +226,4 @@ class MPCPlanner(BasePlanner):
         self.final_obs_0 = None
         self.final_state_0 = None
         self.base_history = None
+        self.prior_actions = None

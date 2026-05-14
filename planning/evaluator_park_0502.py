@@ -41,7 +41,6 @@ class PlanEvaluator:  # evaluator for planning
         self.device = next(wm.parameters()).device
 
         self.plot_full = False  # plot all frames or frames after frameskip
-        self.print_action_stats = True
 
     def assign_init_cond(self, obs_0, state_0):
         self.obs_0 = obs_0
@@ -181,45 +180,7 @@ class PlanEvaluator:  # evaluator for planning
         exec_actions = rearrange(
             actions.cpu(), "b t (f d) -> b (t f) d", f=self.frameskip
         )
-        raw_exec_actions = self.preprocessor.denormalize_actions(exec_actions).detach().numpy()
-        out_of_bounds = np.maximum(np.abs(raw_exec_actions[..., :2]) - 1.0, 0.0)
-        n_oob = int(np.count_nonzero(out_of_bounds > 1e-6))
-        max_oob = float(out_of_bounds.max()) if out_of_bounds.size > 0 else 0.0
-        exec_actions = np.clip(raw_exec_actions, -1.0, 1.0)
-        if self.print_action_stats and exec_actions.size > 0:
-            steer = exec_actions[..., 0]
-            throttle = exec_actions[..., 1]
-            print(
-                f"[Action Stats] {filename}: "
-                f"steer min/mean/max={steer.min():.3f}/{steer.mean():.3f}/{steer.max():.3f}, "
-                f"throttle min/mean/max={throttle.min():.3f}/{throttle.mean():.3f}/{throttle.max():.3f}, "
-                f"raw_oob_count/max={n_oob}/{max_oob:.3f}"
-            )
-            macro_actions = exec_actions.reshape(
-                exec_actions.shape[0], actions.shape[1], self.frameskip, exec_actions.shape[-1]
-            )
-            macro_mean = macro_actions.mean(axis=2)
-            macro_std = macro_actions.std(axis=2)
-            max_samples_to_print = min(3, macro_mean.shape[0])
-            for sample_idx in range(max_samples_to_print):
-                seq = " ".join(
-                    f"{t}:({macro_mean[sample_idx, t, 0]:+.3f},{macro_mean[sample_idx, t, 1]:+.3f})"
-                    for t in range(macro_mean.shape[1])
-                )
-                intra = float(macro_std[sample_idx, :, :2].max())
-                print(
-                    f"[Action Seq] {filename} sample{sample_idx} macro_mean(steer,throttle): "
-                    f"{seq} | max_intra_macro_std={intra:.3f}"
-                )
-                if sample_idx == 0:
-                    detail = " ".join(
-                        f"{t}:[" + " ".join(
-                            f"({macro_actions[sample_idx, t, j, 0]:+.2f},{macro_actions[sample_idx, t, j, 1]:+.2f})"
-                            for j in range(macro_actions.shape[2])
-                        ) + "]"
-                        for t in range(macro_actions.shape[1])
-                    )
-                    print(f"[Action Detail] {filename} sample0 physical_steps: {detail}")
+        exec_actions = self.preprocessor.denormalize_actions(exec_actions).numpy()
 
         # 👇 ====== 核心修复：历史回放与画面对齐 ====== 👇
         if hasattr(self, "history_actions") and self.history_actions is not None:
@@ -228,7 +189,6 @@ class PlanEvaluator:  # evaluator for planning
                 self.history_actions.cpu(), "b t (f d) -> b (t f) d", f=self.frameskip
             )
             history_exec = self.preprocessor.denormalize_actions(history_exec).numpy()
-            history_exec = np.clip(history_exec, -1.0, 1.0)
             full_exec_actions = np.concatenate([history_exec, exec_actions], axis=1)
             hist_len = history_exec.shape[1]
         else:
@@ -261,8 +221,7 @@ class PlanEvaluator:  # evaluator for planning
 
         # plot trajs
         if self.wm.decoder is not None:
-            with torch.no_grad():
-                i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
             # 👇 Debug 2: 看看 mask 之前和之后的形状
             # print(f"[Debug] Mask 前 i_visuals 形状: {i_visuals.shape}")
             i_visuals = self._mask_traj(i_visuals, action_len + 1)

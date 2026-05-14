@@ -134,8 +134,8 @@ class MPPIPlanner(BasePlanner):
                 # NOTE: scaled down aggressively for short-horizon MPC loops
                 # so the car does not crawl forward timidly.
                 # ==============================================================
-                terminal_penalty = 0.2 * torch.sum(action[:, -1, :] ** 2, dim=1)
-                loss = loss + terminal_penalty
+                # terminal_penalty = 0.2 * torch.sum(action[:, -1, :] ** 2, dim=1)
+                # loss = loss + terminal_penalty
 
                 # 信息论 Softmax 加权
                 beta = torch.min(loss)

@@ -22,6 +22,7 @@ from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
 from preprocessor import Preprocessor
 from planning.evaluator_park import PlanEvaluator
+from planning.retrieval_prior import TrajectoryRetrievalPrior
 from utils import cfg_to_dict, seed, move_to_device
 
 from metadrive.envs.marl_envs import MultiAgentParkingLotEnv
@@ -1241,6 +1242,8 @@ class PlanWorkspace:
         self.setup_snap_warn_dist = cfg_dict.get("setup_snap_warn_dist", 1.0)
         self.setup_neighbor_suppress_radius = cfg_dict.get("setup_neighbor_suppress_radius", 1.0)
         self.expert_oracle_cfg = cfg_dict.get("expert_oracle", {})
+        self.retrieval_cfg = cfg_dict.get("retrieval_guided", {})
+        self.retrieval_prior = None
         self.action_dim = self.dset.action_dim
         self.debug_dset_init = cfg_dict["debug_dset_init"]
 
@@ -1259,6 +1262,24 @@ class PlanWorkspace:
         else:
             self.prepare_targets()
 
+        if self._retrieval_guided_enabled():
+            data_path = self.retrieval_cfg.get("data_path", None)
+            if data_path is None:
+                raise ValueError("retrieval_guided.enabled=True requires retrieval_guided.data_path.")
+            self.retrieval_prior = TrajectoryRetrievalPrior(
+                data_path=data_path,
+                horizon=int(self.phase_H),
+                frameskip=int(self.frameskip),
+                top_k=int(self.retrieval_cfg.get("top_k", 1)),
+                max_files=self.retrieval_cfg.get("max_files", None),
+                max_segments_per_file=self.retrieval_cfg.get("max_segments_per_file", None),
+                stride=int(self.retrieval_cfg.get("stride", 1)),
+                weights=self.retrieval_cfg.get("weights", None),
+                include_absolute_weight=float(self.retrieval_cfg.get("include_absolute_weight", 0.0)),
+                start_proprio_weight=self.retrieval_cfg.get("start_proprio_weight", None),
+                feature_source=self.retrieval_cfg.get("feature_source", "image_pose"),
+            ).build()
+
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
@@ -1271,6 +1292,9 @@ class PlanWorkspace:
             preprocessor=self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
         )
+        diagnostics_cfg = self.cfg_dict.get("diagnostics", {})
+        self.evaluator.plot_full = bool(diagnostics_cfg.get("plot_full_rollout_images", False))
+        self.evaluator.print_action_stats = bool(diagnostics_cfg.get("print_action_stats", False))
 
         if self.wandb_run is None or isinstance(self.wandb_run, wandb.sdk.lib.disabled.RunDisabled):
             self.wandb_run = DummyWandbRun()
@@ -1288,7 +1312,7 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = int(self.phase_H)
             self.planner.n_taken_actions = cfg_dict["planner"]["n_taken_actions"]
@@ -1533,6 +1557,10 @@ class PlanWorkspace:
         """Apply the shared MPC config for this phase without replacing sub_planner."""
         planner_cfg = self.cfg_dict["planner"]
         self.planner.logging_prefix = f"mpc_phase{phase_idx}"
+        self.planner.save_video = bool(planner_cfg.get("save_video", self.planner.save_video))
+        self.planner.save_rollout_images = bool(
+            self.cfg_dict.get("diagnostics", {}).get("save_planner_rollout_images", True)
+        )
         requested_taken = planner_cfg.get("n_taken_actions", self.planner.n_taken_actions)
         self.planner.n_taken_actions = min(int(requested_taken), int(self.planner.sub_planner.horizon))
         max_iter = planner_cfg.get("max_iter", self.planner.max_iter)
@@ -1540,7 +1568,7 @@ class PlanWorkspace:
 
     def _setup_phase_transition(self, actions, phase_idx, num_phases, cur_obs):
         """Set up continuity between phases: base_history, init_actions, evaluator init_cond."""
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         if not isinstance(self.planner, MPCPlanner):
             return
 
@@ -1574,6 +1602,11 @@ class PlanWorkspace:
             physical_actions[..., :2] = pair
 
     def _normalize_physical_macro_actions(self, physical_actions):
+        if physical_actions.ndim == 4:
+            b, k, t, d = physical_actions.shape
+            flat = physical_actions.reshape(b * k, t, d)
+            normalized = self._normalize_physical_macro_actions(flat)
+            return normalized.reshape(b, k, t, d).to(self.device)
         if self.action_dim % 2 == 0:
             per_step = rearrange(physical_actions.cpu(), "b t (f d) -> b (t f) d", d=2)
             normalized = self.data_preprocessor.normalize_actions(per_step)
@@ -1615,6 +1648,12 @@ class PlanWorkspace:
 
     def _expert_oracle_enabled(self):
         return bool(self.expert_oracle_cfg.get("enabled", False))
+
+    def _expert_guided_enabled(self):
+        return bool(self.cfg_dict.get("expert_guided", {}).get("enabled", False))
+
+    def _retrieval_guided_enabled(self):
+        return bool(self.cfg_dict.get("retrieval_guided", {}).get("enabled", False))
 
     def _expert_oracle_horizon(self):
         frames = self.expert_oracle_cfg.get("frames", None)
@@ -1746,6 +1785,154 @@ class PlanWorkspace:
             file.write(json.dumps(logs_entry) + "\n")
         self.evaluator.history_actions = None
         return phase_actions, e_final_obs, e_final_state
+
+    def _phase_expert_prior_actions(self, phase_idx):
+        goal_obs = self._current_phase_goal_obs(phase_idx)
+        if "expert_action_segment" not in goal_obs:
+            raise KeyError(
+                f"phase {phase_idx} has no expert_action_segment; "
+                "expert-guided MPPI requires trace-based expert subgoals."
+            )
+        horizon = int(self.planner.sub_planner.horizon)
+        n_steps = horizon * int(self.frameskip)
+        segment = np.asarray(goal_obs["expert_action_segment"][:, 0], dtype=np.float32)
+        if segment.shape[1] != n_steps:
+            fixed = np.zeros((segment.shape[0], n_steps, 2), dtype=np.float32)
+            take = min(segment.shape[1], n_steps)
+            fixed[:, :take] = segment[:, :take]
+            segment = fixed
+        expert_physical = segment.reshape(segment.shape[0], horizon, self.action_dim)
+        prior_actions = self._normalize_physical_macro_actions(
+            torch.tensor(expert_physical, dtype=torch.float32)
+        )
+        frame_idx = np.asarray(goal_obs.get("expert_frame_idx", [-1])).reshape(-1)[0]
+        print(
+            f"[Expert Guided] phase={phase_idx} prior=trace "
+            f"target_frame={frame_idx} H={horizon} frames={n_steps}",
+            flush=True,
+        )
+        return prior_actions
+
+    def _phase_retrieval_prior_actions(
+        self,
+        phase_idx,
+        cur_obs,
+        goal_obs,
+        cur_state,
+        goal_state,
+        accumulated_actions=None,
+    ):
+        if self.retrieval_prior is None:
+            raise RuntimeError("retrieval prior was not built.")
+        horizon = int(self.planner.sub_planner.horizon)
+        if horizon != int(self.retrieval_prior.horizon):
+            raise ValueError(
+                f"retrieval prior horizon={self.retrieval_prior.horizon} "
+                f"does not match planner horizon={horizon}."
+        )
+        mode = self.retrieval_cfg.get("proposal_mode", "nearest")
+        top_k = int(self.retrieval_cfg.get("top_k", 1))
+        if self.retrieval_cfg.get("feature_source", "image_pose") == "image_pose":
+            current_images = np.asarray(cur_obs["visual"])[:, -1]
+            goal_images = np.asarray(goal_obs["visual"])[:, 0]
+            physical, result, query_start, query_goal = self.retrieval_prior.proposal_mean_from_images(
+                current_images=current_images,
+                goal_images=goal_images,
+                top_k=top_k,
+                mode=mode,
+                current_proprio=np.asarray(cur_obs["proprio"])[:, -1],
+            )
+        else:
+            physical, result = self.retrieval_prior.proposal_mean(
+                current_state=cur_state,
+                goal_state=goal_state,
+                top_k=top_k,
+                mode=mode,
+            )
+            query_start = np.asarray(cur_state, dtype=np.float32)
+            query_goal = np.asarray(goal_state, dtype=np.float32)
+        if mode == "bank":
+            physical = result.actions
+        prior_actions = self._normalize_physical_macro_actions(
+            torch.tensor(physical, dtype=torch.float32)
+        )
+        best_dist = result.distances[:, 0]
+        best_frame = result.start_frames[:, 0]
+        best_file = result.file_indices[:, 0]
+        start_pose = result.start_states[:, 0]
+        end_pose = result.end_states[:, 0]
+        start_proprio = result.start_proprios[:, 0]
+        current_proprio = np.asarray(cur_obs["proprio"], dtype=np.float32)[:, -1]
+        for b in range(prior_actions.shape[0]):
+            print(
+                f"[Retrieval Guided] phase={phase_idx} sample={b} "
+                f"mode={mode} top_k={top_k} dist={float(best_dist[b]):.4f} "
+                f"cur_prop=({current_proprio[b,0]:.2f},{current_proprio[b,1]:.2f}) "
+                f"seg_prop=({start_proprio[b,0]:.2f},{start_proprio[b,1]:.2f}) "
+                f"query_start=({query_start[b,0]:.2f},{query_start[b,1]:.2f},{query_start[b,2]:.2f}) "
+                f"query_goal=({query_goal[b,0]:.2f},{query_goal[b,1]:.2f},{query_goal[b,2]:.2f}) "
+                f"file={int(best_file[b])} frame={int(best_frame[b])} "
+                f"seg_start=({start_pose[b,0]:.2f},{start_pose[b,1]:.2f},{start_pose[b,2]:.2f}) "
+                f"seg_end=({end_pose[b,0]:.2f},{end_pose[b,1]:.2f},{end_pose[b,2]:.2f})",
+                flush=True,
+            )
+        self._print_retrieval_env_probe(
+            phase_idx=phase_idx,
+            goal_obs=goal_obs,
+            goal_state=goal_state,
+            result=result,
+            accumulated_actions=accumulated_actions,
+        )
+        return prior_actions
+
+    def _print_retrieval_env_probe(
+        self,
+        phase_idx,
+        goal_obs,
+        goal_state,
+        result,
+        accumulated_actions=None,
+    ):
+        if result.actions.shape[0] == 0:
+            return
+        actions_np = np.asarray(result.actions[0], dtype=np.float32)
+        max_print = min(actions_np.shape[0], int(self.retrieval_cfg.get("probe_top_k", 5)))
+        if max_print <= 0:
+            return
+        rows = []
+        norm_actions = self._normalize_physical_macro_actions(
+            torch.tensor(actions_np[:max_print], dtype=torch.float32)
+        )
+        wm_losses = self._compute_probe_wm_losses(
+            self.evaluator.obs_0,
+            goal_obs,
+            norm_actions,
+        )
+        for k in range(max_print):
+            metrics = self._eval_physical_macro_actions(
+                goal_state,
+                actions_np[k],
+                accumulated_actions=accumulated_actions,
+            )
+            macro = actions_np[k].reshape(actions_np.shape[1], self.frameskip, 2).mean(axis=1)
+            rows.append((k, metrics, macro, float(wm_losses[k])))
+        print(
+            "[Retrieval Probe] phase | k | nn_dist | start_prop | env_dist | env_head | success | wm_loss | macro_mean",
+            flush=True,
+        )
+        for k, metrics, macro, wm_loss in rows:
+            seq = " ".join(
+                f"{t}:({macro[t,0]:+.2f},{macro[t,1]:+.2f})"
+                for t in range(macro.shape[0])
+            )
+            print(
+                f"[Retrieval Probe] {phase_idx} | {k} | "
+                f"{float(result.distances[0, k]):.3f} | "
+                f"({result.start_proprios[0, k, 0]:.2f},{result.start_proprios[0, k, 1]:.2f}) | "
+                f"{metrics['distance']:.3f} | {metrics['heading_error']:.3f} | "
+                f"{metrics['success']} | {wm_loss:.6f} | {seq}",
+                flush=True,
+            )
 
     def _build_action_probe_candidates(self, cur_state, goal_state, horizon, accumulated_actions=None):
         """Return hand-written candidate actions in normalized planner space."""
@@ -1924,7 +2111,7 @@ class PlanWorkspace:
             print("[Action Probe] skipped: currently only supports n_evals=1 for clear ranking.")
             return
 
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         horizon = self.planner.sub_planner.horizon if isinstance(self.planner, MPCPlanner) else self.goal_H
         names, pairs, actions = self._build_action_probe_candidates(
             cur_state[0], goal_state[0], horizon, accumulated_actions=accumulated_actions
@@ -1991,9 +2178,15 @@ class PlanWorkspace:
         if hasattr(final_wm, "init_actions"):
             final_wm.init_actions = None
 
-        logs, successes, _, _ = self.evaluator.eval_actions(
-            actions.detach(), action_len, save_video=True, filename=filename_prefix
+        save_final_video = bool(
+            self.cfg_dict.get("diagnostics", {}).get("save_final_merged_video", True)
         )
+        logs, successes, _, _ = self.evaluator.eval_actions(
+            actions.detach(), action_len, save_video=save_final_video, filename=filename_prefix
+        )
+        if save_final_video:
+            success_tag = "success" if bool(np.any(successes)) else "failure"
+            print(f"[Final Video] saved merged rollout: {filename_prefix}_0_{success_tag}.mp4")
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
         logs_entry = {key: (value.item() if isinstance(value, (np.float32, np.int32, np.int64)) else value) for
@@ -2003,7 +2196,7 @@ class PlanWorkspace:
         return logs
 
     def perform_planning(self):
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         is_hierarchical = hasattr(self, 'obs_g_sub_list') and isinstance(self.planner, MPCPlanner)
 
         if is_hierarchical:
@@ -2044,7 +2237,20 @@ class PlanWorkspace:
                     accumulated_actions=accumulated,
                 )
 
-                if self._expert_oracle_enabled():
+                if self._retrieval_guided_enabled():
+                    self.planner.prior_actions = self._phase_retrieval_prior_actions(
+                        phase_idx=phase_idx,
+                        cur_obs=cur_obs,
+                        goal_obs=phase_goal_obs_list[phase_idx],
+                        cur_state=cur_state,
+                        goal_state=phase_goal_state_list[phase_idx],
+                        accumulated_actions=accumulated,
+                    )
+                    phase_actions, _ = self.planner.plan(obs_0=cur_obs, obs_g=phase_goal_obs_list[phase_idx])
+                elif self._expert_guided_enabled():
+                    self.planner.prior_actions = self._phase_expert_prior_actions(phase_idx)
+                    phase_actions, _ = self.planner.plan(obs_0=cur_obs, obs_g=phase_goal_obs_list[phase_idx])
+                elif self._expert_oracle_enabled():
                     phase_actions, cur_obs, cur_state = self._plan_phase_with_expert_oracle(
                         phase_idx=phase_idx,
                         cur_obs=cur_obs,
@@ -2053,6 +2259,7 @@ class PlanWorkspace:
                         accumulated_actions=accumulated,
                     )
                 else:
+                    self.planner.prior_actions = None
                     phase_actions, _ = self.planner.plan(obs_0=cur_obs, obs_g=phase_goal_obs_list[phase_idx])
                 all_actions.append(phase_actions)
                 if torch.cuda.is_available():
@@ -2085,7 +2292,7 @@ class PlanWorkspace:
             )
 
         prefix = getattr(self.planner, "logging_prefix", "final")
-        return self._final_eval_actions(actions, action_len, f"{prefix}_final")
+        return self._final_eval_actions(actions, action_len, f"{prefix}_merged_final")
 
 def planning_main(cfg_dict):
     output_dir = cfg_dict["saved_folder"]
@@ -2102,6 +2309,15 @@ def planning_main(cfg_dict):
         model_cfg = OmegaConf.load(f)
 
     seed(cfg_dict["seed"])
+
+    if cfg_dict.get("retrieval_guided", {}).get("enabled", False):
+        retrieval_cfg = cfg_dict["retrieval_guided"]
+        if retrieval_cfg.get("data_path", None) is None:
+            retrieval_cfg["data_path"] = model_cfg.env.dataset.data_path
+            print(
+                f"[Retrieval Guided] using model training data: {retrieval_cfg['data_path']}",
+                flush=True,
+            )
     
     # 加载数据集
     datasets, traj_dsets = hydra.utils.call(
@@ -2243,7 +2459,7 @@ def planning_main(cfg_dict):
     logs = plan_workspace.perform_planning()
     return logs
 
-@hydra.main(config_path="conf", config_name="plan")
+@hydra.main(config_path="conf", config_name="plan_park_retrieval")
 def main(cfg: OmegaConf):
     with open_dict(cfg):
         cfg["saved_folder"] = os.getcwd()

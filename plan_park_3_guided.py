@@ -1271,6 +1271,9 @@ class PlanWorkspace:
             preprocessor=self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
         )
+        diagnostics_cfg = self.cfg_dict.get("diagnostics", {})
+        self.evaluator.plot_full = bool(diagnostics_cfg.get("plot_full_rollout_images", False))
+        self.evaluator.print_action_stats = bool(diagnostics_cfg.get("print_action_stats", False))
 
         if self.wandb_run is None or isinstance(self.wandb_run, wandb.sdk.lib.disabled.RunDisabled):
             self.wandb_run = DummyWandbRun()
@@ -1288,7 +1291,7 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = int(self.phase_H)
             self.planner.n_taken_actions = cfg_dict["planner"]["n_taken_actions"]
@@ -1533,6 +1536,10 @@ class PlanWorkspace:
         """Apply the shared MPC config for this phase without replacing sub_planner."""
         planner_cfg = self.cfg_dict["planner"]
         self.planner.logging_prefix = f"mpc_phase{phase_idx}"
+        self.planner.save_video = bool(planner_cfg.get("save_video", self.planner.save_video))
+        self.planner.save_rollout_images = bool(
+            self.cfg_dict.get("diagnostics", {}).get("save_planner_rollout_images", True)
+        )
         requested_taken = planner_cfg.get("n_taken_actions", self.planner.n_taken_actions)
         self.planner.n_taken_actions = min(int(requested_taken), int(self.planner.sub_planner.horizon))
         max_iter = planner_cfg.get("max_iter", self.planner.max_iter)
@@ -1540,7 +1547,7 @@ class PlanWorkspace:
 
     def _setup_phase_transition(self, actions, phase_idx, num_phases, cur_obs):
         """Set up continuity between phases: base_history, init_actions, evaluator init_cond."""
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         if not isinstance(self.planner, MPCPlanner):
             return
 
@@ -1615,6 +1622,9 @@ class PlanWorkspace:
 
     def _expert_oracle_enabled(self):
         return bool(self.expert_oracle_cfg.get("enabled", False))
+
+    def _expert_guided_enabled(self):
+        return bool(self.cfg_dict.get("expert_guided", {}).get("enabled", False))
 
     def _expert_oracle_horizon(self):
         frames = self.expert_oracle_cfg.get("frames", None)
@@ -1746,6 +1756,33 @@ class PlanWorkspace:
             file.write(json.dumps(logs_entry) + "\n")
         self.evaluator.history_actions = None
         return phase_actions, e_final_obs, e_final_state
+
+    def _phase_expert_prior_actions(self, phase_idx):
+        goal_obs = self._current_phase_goal_obs(phase_idx)
+        if "expert_action_segment" not in goal_obs:
+            raise KeyError(
+                f"phase {phase_idx} has no expert_action_segment; "
+                "expert-guided MPPI requires trace-based expert subgoals."
+            )
+        horizon = int(self.planner.sub_planner.horizon)
+        n_steps = horizon * int(self.frameskip)
+        segment = np.asarray(goal_obs["expert_action_segment"][:, 0], dtype=np.float32)
+        if segment.shape[1] != n_steps:
+            fixed = np.zeros((segment.shape[0], n_steps, 2), dtype=np.float32)
+            take = min(segment.shape[1], n_steps)
+            fixed[:, :take] = segment[:, :take]
+            segment = fixed
+        expert_physical = segment.reshape(segment.shape[0], horizon, self.action_dim)
+        prior_actions = self._normalize_physical_macro_actions(
+            torch.tensor(expert_physical, dtype=torch.float32)
+        )
+        frame_idx = np.asarray(goal_obs.get("expert_frame_idx", [-1])).reshape(-1)[0]
+        print(
+            f"[Expert Guided] phase={phase_idx} prior=trace "
+            f"target_frame={frame_idx} H={horizon} frames={n_steps}",
+            flush=True,
+        )
+        return prior_actions
 
     def _build_action_probe_candidates(self, cur_state, goal_state, horizon, accumulated_actions=None):
         """Return hand-written candidate actions in normalized planner space."""
@@ -1924,7 +1961,7 @@ class PlanWorkspace:
             print("[Action Probe] skipped: currently only supports n_evals=1 for clear ranking.")
             return
 
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         horizon = self.planner.sub_planner.horizon if isinstance(self.planner, MPCPlanner) else self.goal_H
         names, pairs, actions = self._build_action_probe_candidates(
             cur_state[0], goal_state[0], horizon, accumulated_actions=accumulated_actions
@@ -1991,9 +2028,15 @@ class PlanWorkspace:
         if hasattr(final_wm, "init_actions"):
             final_wm.init_actions = None
 
-        logs, successes, _, _ = self.evaluator.eval_actions(
-            actions.detach(), action_len, save_video=True, filename=filename_prefix
+        save_final_video = bool(
+            self.cfg_dict.get("diagnostics", {}).get("save_final_merged_video", True)
         )
+        logs, successes, _, _ = self.evaluator.eval_actions(
+            actions.detach(), action_len, save_video=save_final_video, filename=filename_prefix
+        )
+        if save_final_video:
+            success_tag = "success" if bool(np.any(successes)) else "failure"
+            print(f"[Final Video] saved merged rollout: {filename_prefix}_0_{success_tag}.mp4")
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
         logs_entry = {key: (value.item() if isinstance(value, (np.float32, np.int32, np.int64)) else value) for
@@ -2003,7 +2046,7 @@ class PlanWorkspace:
         return logs
 
     def perform_planning(self):
-        from planning.mpc_park import MPCPlanner
+        from planning.mpc_park_guided import MPCPlannerGuided as MPCPlanner
         is_hierarchical = hasattr(self, 'obs_g_sub_list') and isinstance(self.planner, MPCPlanner)
 
         if is_hierarchical:
@@ -2044,7 +2087,10 @@ class PlanWorkspace:
                     accumulated_actions=accumulated,
                 )
 
-                if self._expert_oracle_enabled():
+                if self._expert_guided_enabled():
+                    self.planner.prior_actions = self._phase_expert_prior_actions(phase_idx)
+                    phase_actions, _ = self.planner.plan(obs_0=cur_obs, obs_g=phase_goal_obs_list[phase_idx])
+                elif self._expert_oracle_enabled():
                     phase_actions, cur_obs, cur_state = self._plan_phase_with_expert_oracle(
                         phase_idx=phase_idx,
                         cur_obs=cur_obs,
@@ -2053,6 +2099,7 @@ class PlanWorkspace:
                         accumulated_actions=accumulated,
                     )
                 else:
+                    self.planner.prior_actions = None
                     phase_actions, _ = self.planner.plan(obs_0=cur_obs, obs_g=phase_goal_obs_list[phase_idx])
                 all_actions.append(phase_actions)
                 if torch.cuda.is_available():
@@ -2085,7 +2132,7 @@ class PlanWorkspace:
             )
 
         prefix = getattr(self.planner, "logging_prefix", "final")
-        return self._final_eval_actions(actions, action_len, f"{prefix}_final")
+        return self._final_eval_actions(actions, action_len, f"{prefix}_merged_final")
 
 def planning_main(cfg_dict):
     output_dir = cfg_dict["saved_folder"]
@@ -2243,7 +2290,7 @@ def planning_main(cfg_dict):
     logs = plan_workspace.perform_planning()
     return logs
 
-@hydra.main(config_path="conf", config_name="plan")
+@hydra.main(config_path="conf", config_name="plan_park_guided")
 def main(cfg: OmegaConf):
     with open_dict(cfg):
         cfg["saved_folder"] = os.getcwd()

@@ -24,7 +24,7 @@ class MPCPlanner(BasePlanner):
         preprocessor,
         evaluator,
         wandb_run,
-        logging_prefix="mpc_phase0",
+        logging_prefix="mpc",
         log_filename="logs.json",
         **kwargs,
     ):
